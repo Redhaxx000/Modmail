@@ -37,7 +37,7 @@ type ModmailLog struct {
 
 func main() {
 	if Token == "" || GuildID == "" || CategoryID == "" || MongoURI == "" {
-		log.Fatal("Missing required environment variables.")
+		log.Fatal("Missing environment variables.")
 	}
 
 	client, err := mongo.Connect(options.Client().ApplyURI(MongoURI))
@@ -54,8 +54,7 @@ func main() {
 	dg.Identify.Intents = discordgo.IntentDirectMessages | discordgo.IntentGuildMessages | discordgo.IntentMessageContent | discordgo.IntentGuilds
 	dg.AddHandler(messageCreate)
 
-	err = dg.Open()
-	if err != nil {
+	if err = dg.Open(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -66,7 +65,7 @@ func main() {
 		http.ListenAndServe(":"+port, nil)
 	}()
 
-	fmt.Println("Bot is live. Errors fixed.")
+	fmt.Println("Bot is live. Ticket creation alerts and reactions enabled.")
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-stop
@@ -90,15 +89,27 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			}
 		}
 
+		// First-time ticket creation logic
 		if targetChannel == nil {
 			targetChannel, _ = s.GuildChannelCreateComplex(GuildID, discordgo.GuildChannelCreateData{
 				Name: channelName, Type: discordgo.ChannelTypeGuildText, ParentID: CategoryID, Topic: "Modmail ID: " + m.Author.ID,
 			})
+			
+			// Notify User of creation
+			s.ChannelMessageSendEmbed(m.ChannelID, &discordgo.MessageEmbed{
+				Title: "🎫 Ticket Created",
+				Description: "Your message has been sent to the staff. Please wait for a response.",
+				Color: 0x2ecc71,
+				Timestamp: time.Now().Format(time.RFC3339),
+			})
+
+			// Notify Staff in new channel
 			s.ChannelMessageSendEmbed(targetChannel.ID, &discordgo.MessageEmbed{
 				Title: "🆕 New Ticket", Description: "User: " + m.Author.Mention(), Color: 0x3498db,
 			})
 		}
 
+		// Forward message to staff channel
 		embed := &discordgo.MessageEmbed{
 			Author: &discordgo.MessageEmbedAuthor{Name: m.Author.Username, IconURL: m.Author.AvatarURL("")},
 			Description: m.Content,
@@ -106,15 +117,22 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		}
 		if len(m.Attachments) > 0 { embed.Image = &discordgo.MessageEmbedImage{URL: m.Attachments[0].URL} }
 
-		s.ChannelMessageSendEmbed(targetChannel.ID, embed)
+		staffMsg, err := s.ChannelMessageSendEmbed(targetChannel.ID, embed)
+		if err == nil {
+			// React to the message in the staff channel to show it arrived
+			s.MessageReactionAdd(targetChannel.ID, staffMsg.ID, "📩")
+		}
+		
 		logToDB(m.Author.ID, m.Content, "user", len(m.Attachments) > 0)
 		return
 	}
 
 	// 2. STAFF -> USER
-	// We first get the channel object to check the name and topic
-	ch, err := s.Channel(m.ChannelID)
-	if err != nil || ch.GuildID != GuildID || !strings.HasPrefix(ch.Name, "ticket-") {
+	ch, err := s.State.Channel(m.ChannelID)
+	if err != nil {
+		ch, _ = s.Channel(m.ChannelID)
+	}
+	if ch == nil || ch.ParentID != CategoryID || !strings.HasPrefix(ch.Name, "ticket-") {
 		return
 	}
 
@@ -124,7 +142,6 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 	if userID == "" { return }
 
-	// Handle !close
 	if strings.ToLower(m.Content) == "!close" {
 		s.ChannelDelete(m.ChannelID)
 		dm, _ := s.UserChannelCreate(userID)
@@ -132,7 +149,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	// Forward message
+	// Forward to user
 	dm, err := s.UserChannelCreate(userID)
 	if err != nil { return }
 
@@ -143,8 +160,11 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	_, err = s.ChannelMessageSendEmbed(dm.ID, embed)
 	if err == nil {
+		// React to the staff's message to confirm it was sent to the user
 		s.MessageReactionAdd(m.ChannelID, m.ID, "✅")
 		logToDB(userID, m.Content, "staff", len(m.Attachments) > 0)
+	} else {
+		s.ChannelMessageSend(m.ChannelID, "❌ Failed to send DM (DMs might be closed).")
 	}
 }
 
