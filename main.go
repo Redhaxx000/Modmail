@@ -54,7 +54,8 @@ func main() {
 	dg.Identify.Intents = discordgo.IntentDirectMessages | discordgo.IntentGuildMessages | discordgo.IntentMessageContent | discordgo.IntentGuilds
 	dg.AddHandler(messageCreate)
 
-	if err = dg.Open(); err != nil {
+	err = dg.Open()
+	if err != nil {
 		log.Fatal(err)
 	}
 
@@ -65,7 +66,7 @@ func main() {
 		http.ListenAndServe(":"+port, nil)
 	}()
 
-	fmt.Println("Bot Online with Image Support.")
+	fmt.Println("Bot is live. Errors fixed.")
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-stop
@@ -74,7 +75,7 @@ func main() {
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if m.Author.ID == s.State.User.ID { return }
 
-	// 1. USER -> STAFF
+	// 1. USER -> STAFF (Incoming DM)
 	if m.GuildID == "" {
 		reg, _ := regexp.Compile("[^a-zA-Z0-9]+")
 		cleanName := strings.ToLower(reg.ReplaceAllString(m.Author.Username, ""))
@@ -103,11 +104,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			Description: m.Content,
 			Color: 0x2ecc71,
 		}
-
-		// Handle Attachment
-		if len(m.Attachments) > 0 {
-			embed.Image = &discordgo.MessageEmbedImage{URL: m.Attachments[0].URL}
-		}
+		if len(m.Attachments) > 0 { embed.Image = &discordgo.MessageEmbedImage{URL: m.Attachments[0].URL} }
 
 		s.ChannelMessageSendEmbed(targetChannel.ID, embed)
 		logToDB(m.Author.ID, m.Content, "user", len(m.Attachments) > 0)
@@ -115,36 +112,39 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 
 	// 2. STAFF -> USER
-	if m.GuildID == GuildID && strings.HasPrefix(m.Channel.Name, "ticket-") {
-		userID := ""
-		if strings.HasPrefix(m.Channel.Topic, "Modmail ID: ") {
-			userID = strings.TrimPrefix(m.Channel.Topic, "Modmail ID: ")
-		}
-		if userID == "" { return }
+	// We first get the channel object to check the name and topic
+	ch, err := s.Channel(m.ChannelID)
+	if err != nil || ch.GuildID != GuildID || !strings.HasPrefix(ch.Name, "ticket-") {
+		return
+	}
 
-		if strings.ToLower(m.Content) == "!close" {
-			s.ChannelDelete(m.ChannelID)
-			dm, _ := s.UserChannelCreate(userID)
-			s.ChannelMessageSend(dm.ID, "🔒 Your ticket has been closed.")
-			return
-		}
+	userID := ""
+	if strings.HasPrefix(ch.Topic, "Modmail ID: ") {
+		userID = strings.TrimPrefix(ch.Topic, "Modmail ID: ")
+	}
+	if userID == "" { return }
 
-		dm, err := s.UserChannelCreate(userID)
-		if err != nil { return }
+	// Handle !close
+	if strings.ToLower(m.Content) == "!close" {
+		s.ChannelDelete(m.ChannelID)
+		dm, _ := s.UserChannelCreate(userID)
+		s.ChannelMessageSend(dm.ID, "🔒 Your ticket has been closed.")
+		return
+	}
 
-		embed := &discordgo.MessageEmbed{
-			Title: "💬 Staff Response", Description: m.Content, Color: 0x3498db,
-		}
+	// Forward message
+	dm, err := s.UserChannelCreate(userID)
+	if err != nil { return }
 
-		if len(m.Attachments) > 0 {
-			embed.Image = &discordgo.MessageEmbedImage{URL: m.Attachments[0].URL}
-		}
+	embed := &discordgo.MessageEmbed{
+		Title: "💬 Staff Response", Description: m.Content, Color: 0x3498db,
+	}
+	if len(m.Attachments) > 0 { embed.Image = &discordgo.MessageEmbedImage{URL: m.Attachments[0].URL} }
 
-		_, err = s.ChannelMessageSendEmbed(dm.ID, embed)
-		if err == nil {
-			s.MessageReactionAdd(m.ChannelID, m.ID, "✅")
-			logToDB(userID, m.Content, "staff", len(m.Attachments) > 0)
-		}
+	_, err = s.ChannelMessageSendEmbed(dm.ID, embed)
+	if err == nil {
+		s.MessageReactionAdd(m.ChannelID, m.ID, "✅")
+		logToDB(userID, m.Content, "staff", len(m.Attachments) > 0)
 	}
 }
 
