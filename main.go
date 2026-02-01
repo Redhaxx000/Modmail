@@ -20,18 +20,17 @@ import (
 var (
 	Token        = os.Getenv("DISCORD_TOKEN")
 	LogChannelID = os.Getenv("LOG_CHANNEL_ID")
-	MongoURI     = os.Getenv("MONGO_URI") // e.g., mongodb+srv://...
+	MongoURI     = os.Getenv("MONGO_URI")
 	MsgCol       *mongo.Collection
 )
 
-// ModmailLog represents the structure of our database document
 type ModmailLog struct {
 	ID        bson.ObjectID `bson:"_id,omitempty"`
 	UserID    string        `bson:"user_id"`
 	Username  string        `bson:"username"`
 	Content   string        `bson:"content"`
 	Timestamp time.Time     `bson:"timestamp"`
-	Type      string        `bson:"type"` // "incoming" or "reply"
+	Type      string        `bson:"type"`
 }
 
 func main() {
@@ -39,18 +38,24 @@ func main() {
 		log.Fatal("Missing environment variables: DISCORD_TOKEN, LOG_CHANNEL_ID, or MONGO_URI")
 	}
 
-	// 1. Initialize MongoDB
+	// --- FIXED CONTEXT USAGE ---
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Pass ctx directly into Connect
 	client, err := mongo.Connect(options.Client().ApplyURI(MongoURI))
 	if err != nil {
 		log.Fatal("MongoDB Connection Error:", err)
 	}
-	MsgCol = client.Database("modmail_db").Collection("messages")
-	fmt.Println("Connected to MongoDB!")
 
-	// 2. Initialize Discord
+	// Ping the database to ensure connection is actually active
+	if err := client.Ping(ctx, nil); err != nil {
+		log.Fatal("Could not ping MongoDB:", err)
+	}
+
+	MsgCol = client.Database("modmail_db").Collection("messages")
+	fmt.Println("Successfully connected to MongoDB!")
+
 	dg, err := discordgo.New("Bot " + Token)
 	if err != nil {
 		log.Fatal("Discord session error:", err)
@@ -63,13 +68,15 @@ func main() {
 		log.Fatal("Discord connection error:", err)
 	}
 
-	// 3. Render Health Check
 	go func() {
 		port := os.Getenv("PORT")
-		if port == "" { port = "10000" }
+		if port == "" {
+			port = "10000"
+		}
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "Bot & DB Online")
 		})
+		log.Printf("Health check listening on port %s", port)
 		http.ListenAndServe(":"+port, nil)
 	}()
 
@@ -77,23 +84,24 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-stop
+
+	dg.Close()
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if m.Author.ID == s.State.User.ID { return }
+	if m.Author.ID == s.State.User.ID {
+		return
+	}
 
-	// Handle User DMs (Incoming)
 	if m.GuildID == "" {
 		logMessage(m.Author.ID, m.Author.Username, m.Content, "incoming")
-		
-		content := fmt.Sprintf("📩 **New Modmail**\n**From:** %s (`%s`)\n\n%s", 
+		content := fmt.Sprintf("📩 **New Modmail**\n**From:** %s (`%s`)\n\n%s",
 			m.Author.Username, m.Author.ID, m.Content)
 		s.ChannelMessageSend(LogChannelID, content)
 		s.ChannelMessageSend(m.ChannelID, "✅ Sent to staff!")
 		return
 	}
 
-	// Handle Staff Replies
 	if m.ChannelID == LogChannelID && strings.HasPrefix(m.Content, "!reply ") {
 		parts := strings.SplitN(m.Content, " ", 3)
 		if len(parts) < 3 {
@@ -123,9 +131,9 @@ func logMessage(uid, user, content, msgType string) {
 		Timestamp: time.Now(),
 		Type:      msgType,
 	}
+	// Using context.Background() here since this is a background fire-and-forget task
 	_, err := MsgCol.InsertOne(context.Background(), entry)
 	if err != nil {
 		log.Println("DB Log Error:", err)
 	}
 }
-
